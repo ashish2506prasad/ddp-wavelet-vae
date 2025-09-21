@@ -255,6 +255,7 @@ def train(args):
                     base_model.save_checkpoint(checkpoint_path, epoch+1, {"val_losses": val_losses})
 
     if rank == 0:
+        print("Training complete. Saving final checkpoint.")
         final_ckpt_path = os.path.join(args.ckpt_path, f"final_checkpoint_epoch_{args.num_epochs}.pt")
         if args.where == "cluster":
             base_model.save_checkpoint(final_ckpt_path, args.num_epochs, {"val_losses": val_losses})

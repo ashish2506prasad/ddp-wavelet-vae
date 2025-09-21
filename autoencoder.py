@@ -111,11 +111,11 @@ class AutoencoderKL(nn.Module):
         # print("Posterior shape:", posterior.shape)
         if sample_posterior:
             z = posterior.sample()
-            print("Sampled z shape:", z.shape)
+            # print("Sampled z shape:", z.shape)
         else:
             z = posterior.mode()
         dec = self.decode(z, num_dwt_tensor)
-        print("Decoded shape:", dec.shape)
+        # print("Decoded shape:", dec.shape)
         return dec, posterior
 
     def get_input(self, batch, k, num_dwt_level):
