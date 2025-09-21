@@ -452,11 +452,20 @@ def test(args):
     results_df.to_csv(os.path.join(output_dir, 'metrics.csv'), index=False)
     print(f"\nMetrics saved to: {os.path.join(output_dir, 'metrics.csv')}")
     print(f"Images saved to: {output_dir}")
-    
+
+
 if __name__ == "__main__":
     args = parse_args()
     train(args)
-    test(args)
+    
+    # Only run test on rank 0
+    if args.where == "cluster":
+        rank = dist.get_rank() if dist.is_initialized() else 0
+    else:
+        rank = 0
+        
+    if rank == 0:
+        test(args)
     
     # Create zip archive
     import shutil
