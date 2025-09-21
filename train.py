@@ -65,6 +65,7 @@ def parse_args():
     parser.add_argument('--device', type=str, default='cuda' if torch.cuda.is_available() else 'cpu', help='Device to use for training')
     parser.add_argument("--num-workers", type=int, default=2)
     parser.add_argument("--where", type=str, choices=["local", "cluster"], default="cluster", help="Run locally or on cluster")
+    parser.add_argument('--num-workers', type=int, default=4, help='Number of data loading workers')
     # parser.add_argument('--global-batch-size', type=int, default=8, help='Global batch size for distributed training')
     parser.add_argument('--val-every', type=int, default=1, help='Validation frequency (epochs)')
     parser.add_argument('--num-dwt-levels', type=int, default=1, help='Number of DWT levels for feature extraction')
@@ -453,7 +454,7 @@ def test(args):
     
 if __name__ == "__main__":
     args = parse_args()
-    # train(args)
+    train(args)
     test(args)
     
     # Create zip archive
