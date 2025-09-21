@@ -258,9 +258,9 @@ def train(args):
         print("Training complete. Saving final checkpoint.")
         final_ckpt_path = os.path.join(args.ckpt_path, f"final_checkpoint_epoch_{args.num_epochs}.pt")
         if args.where == "cluster":
-            base_model.save_checkpoint(final_ckpt_path, args.num_epochs, {"val_losses": val_losses})
+            base_model.save_checkpoint(final_ckpt_path, args.num_epochs, {"val_losses": val_losses if 'val_losses' in locals() else {}})
         else:
-            base_model.save_checkpoint(final_ckpt_path, args.num_epochs, {"val_losses": val_losses})
+            base_model.save_checkpoint(final_ckpt_path, args.num_epochs, {"val_losses": val_losses if 'val_losses' in locals() else {}})
 
 def extract_dwt_features(latent, num_dwt_levels=1, device='cpu'):
     dwt = DWTForward(J=num_dwt_levels, wave='haar', mode='zero').to(device)
