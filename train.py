@@ -456,19 +456,39 @@ def test(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    train(args)
     
-    # Only run test on rank 0
-    if args.where == "cluster":
-        rank = dist.get_rank() if dist.is_initialized() else 0
+    # Determine rank for distributed training
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        is_distributed = True
     else:
         rank = 0
-        
+        is_distributed = False
+    
+    # Run training
+    train(args)
+    
+    # Wait for all processes to finish training (if distributed)
+    if is_distributed:
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.barrier()
+    
+    # Only run test and cleanup on rank 0
     if rank == 0:
         test(args)
+        
+        # Create zip archive only if results directory exists
+        if os.path.exists(args.results_dir):
+            import shutil
+            zip_filename = f"{args.results_dir}_results.zip"
+            shutil.make_archive(zip_filename.replace('.zip', ''), 'zip', args.results_dir)
+            print(f"Results zipped to: {zip_filename}")
+        else:
+            print(f"Results directory {args.results_dir} does not exist, skipping zip creation.")
     
-    # Create zip archive
-    import shutil
-    zip_filename = f"{args.results_dir}_results.zip"
-    shutil.make_archive(zip_filename.replace('.zip', ''), 'zip', args.results_dir)
-    print(f"Results zipped to: {zip_filename}")
+    # Cleanup distributed training
+    if is_distributed:
+        import torch.distributed as dist
+        if dist.is_initialized():
+            dist.destroy_process_group()
