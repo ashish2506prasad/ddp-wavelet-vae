@@ -300,7 +300,7 @@ class AutoencoderKL(nn.Module):
 
     def load_checkpoint(self, path):
         """Load model checkpoint"""
-        checkpoint = torch.load(path, map_location=self.device)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
         self.load_state_dict(checkpoint['model_state_dict'])
         self.opt_ae.load_state_dict(checkpoint['opt_ae_state_dict'])
         self.opt_disc.load_state_dict(checkpoint['opt_disc_state_dict'])

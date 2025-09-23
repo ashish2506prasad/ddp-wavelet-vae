@@ -31,7 +31,22 @@ def center_crop_arr(pil_image, image_size):
     crop_y = (arr.shape[0] - image_size) // 2
     crop_x = (arr.shape[1] - image_size) // 2
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
+
+def compute_global_stats(parent_dir, split='train', feature_type='image', num_dwt_levels=1):
+    image_paths = sorted(glob(f"{parent_dir}/{split}/{feature_type}_{num_dwt_levels}_dwt_LL/*.npy"))
+    all_pixels = []
     
+    for path in image_paths:
+        image = np.load(path)
+        all_pixels.append(image.flatten())
+    
+    all_pixels = np.concatenate(all_pixels)
+    global_mean = all_pixels.mean()
+    global_std = all_pixels.std()
+    
+    print(f"Global mean: {global_mean}, Global std: {global_std}")
+    return global_mean, global_std
+
 class CustomDataset(Dataset):
     """
     Custom dataset to load images from a directory structure.
@@ -43,7 +58,7 @@ class CustomDataset(Dataset):
         does not return class as they are not needed for feature extraction
     """
     
-    def __init__(self, parent_dir, test_data=None, split='train', feature_type ='image', num_dwt_levels = 1, feature_size=128):
+    def __init__(self, parent_dir, test_data=None, split='train', feature_type ='image', num_dwt_levels = 1, feature_size=128, global_mean=None, global_std=None):
         self.parent_dir = parent_dir
         # Fixed: Use parent_dir parameter instead of hardcoded path
         self.num_dwt_levels = num_dwt_levels
@@ -63,7 +78,10 @@ class CustomDataset(Dataset):
                 print(f"Found {len(sorted_images)} images in class {class_}")
                 self.image_paths += sorted_images[int(len(sorted_images)*0.8):]  # Use 20% of images for testing
             print(f"Found {len(self.image_paths)} images in {split} set ")
-    
+
+        self.global_mean = global_mean
+        self.global_std = global_std
+
     def __len__(self):
         return len(self.image_paths)
     
@@ -84,14 +102,24 @@ class CustomDataset(Dataset):
             image = transform(image)
         else:
             # Load .npy file for train/val data
-            # normalize the image
             image = np.load(img_path)
             image = torch.from_numpy(image).float()
-            mean = image.mean()
-            std = image.std() + 1e-8   # avoid division by zero
-            image = (image - mean) / std
-            # image = torch.from_numpy(image).float()
+            
+            # Use global normalization instead of per-image
+            if self.global_mean is not None and self.global_std is not None:
+                image = (image - self.global_mean) / (self.global_std + 1e-8)
+            else:
+                # Fallback to per-image normalization
+                mean = image.mean()
+                std = image.std() + 1e-8
+                image = (image - mean) / std
+            
             image = image.squeeze(0)
-            # print(f"Loaded image shape from .npy: {image.shape}")
         
         return image, self.num_dwt_levels
+
+if __name__ == "__main__":
+    # Example usage
+    # change parent directory as needed
+    global_mean, global_std = compute_global_stats(parent_dir='D:\DDP_amit_sethi\workspace-wavelet-VAE\imagenet256', split='val', feature_type='image', num_dwt_levels=1)
+    print(f"Global Mean: {global_mean}, Global Std: {global_std}")

@@ -28,6 +28,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import glob
+from dataset import compute_global_stats
 
 def parse_args():
     """Parse command line arguments"""
@@ -89,6 +90,10 @@ def parse_args():
     # Logging arguments
     parser.add_argument('--log-freq', type=int, default=100, help='Logging frequency (steps)')
     parser.add_argument('--log-images-freq', type=int, default=1000, help='Image logging frequency (steps)')
+
+    # global mean and std for LL normalization
+    parser.add_argument('--global_mean', type=float, default=None, help='Global mean for LL normalization')
+    parser.add_argument('--global_std', type=float, default=None, help='Global std for LL normalization')
 
     return parser.parse_args()
 
@@ -186,9 +191,9 @@ def train(args):
         model = model.to(device)
         base_model = model
 
-    train_dataset = CustomDataset(args.train_data_path, split='train', feature_type=feature_type, num_dwt_levels=num_dwt_levels) 
+    train_dataset = CustomDataset(args.train_data_path, split='train', feature_type=feature_type, num_dwt_levels=num_dwt_levels, global_mean=args.global_mean, global_std=args.global_std) 
     val_path = args.val_data_path if args.val_data_path else args.train_data_path
-    val_dataset = CustomDataset(val_path, split='val', feature_type=feature_type, num_dwt_levels=num_dwt_levels)
+    val_dataset = CustomDataset(val_path, split='val', feature_type=feature_type, num_dwt_levels=num_dwt_levels, global_mean=args.global_mean, global_std=args.global_std)
     shuffle = True if args.where == "local" else None
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank) if args.where == "cluster" else None
@@ -249,18 +254,34 @@ def train(args):
         if (epoch + 1) % args.save_freq == 0:
             if rank == 0:
                 checkpoint_path = os.path.join(args.ckpt_path, f"checkpoint_epoch_{epoch+1}.pt")
-                if args.where == "cluster":
-                    base_model.save_checkpoint(checkpoint_path, epoch+1, {"val_losses": val_losses})
-                else:
-                    base_model.save_checkpoint(checkpoint_path, epoch+1, {"val_losses": val_losses})
+                # Add global statistics to checkpoint metadata
+                checkpoint_metadata = {
+                    "val_losses": val_losses,
+                    "global_mean": args.global_mean,
+                    "global_std": args.global_std,
+                    "num_dwt_levels": args.num_dwt_levels
+                }
+                base_model.save_checkpoint(checkpoint_path, epoch+1, checkpoint_metadata)
 
+    # Save final checkpoint
     if rank == 0:
         print("Training complete. Saving final checkpoint.")
         final_ckpt_path = os.path.join(args.ckpt_path, f"final_checkpoint_epoch_{args.num_epochs}.pt")
-        if args.where == "cluster":
-            base_model.save_checkpoint(final_ckpt_path, args.num_epochs, {"val_losses": val_losses if 'val_losses' in locals() else {}})
-        else:
-            base_model.save_checkpoint(final_ckpt_path, args.num_epochs, {"val_losses": val_losses if 'val_losses' in locals() else {}})
+        final_metadata = {
+            "val_losses": val_losses if 'val_losses' in locals() else {},
+            "global_mean": args.global_mean,
+            "global_std": args.global_std,
+            "num_dwt_levels": args.num_dwt_levels
+        }
+        base_model.save_checkpoint(final_ckpt_path, args.num_epochs, final_metadata)
+
+    # if rank == 0:
+    #     print("Training complete. Saving final checkpoint.")
+    #     final_ckpt_path = os.path.join(args.ckpt_path, f"final_checkpoint_epoch_{args.num_epochs}.pt")
+    #     if args.where == "cluster":
+    #         base_model.save_checkpoint(final_ckpt_path, args.num_epochs, {"val_losses": val_losses if 'val_losses' in locals() else {}})
+    #     else:
+    #         base_model.save_checkpoint(final_ckpt_path, args.num_epochs, {"val_losses": val_losses if 'val_losses' in locals() else {}})
 
 def extract_dwt_features(latent, num_dwt_levels=1, device='cpu'):
     dwt = DWTForward(J=num_dwt_levels, wave='haar', mode='zero').to(device)
@@ -309,14 +330,40 @@ def test(args):
                             colorize_nlabels=args.colorize_nlabels,
                             monitor=args.monitor, device=device)
     
-    # Load checkpoint
-    checkpoint_files = glob.glob(os.path.join(args.ckpt_path, "*.pt"))
-    if checkpoint_files:
-        latest_ckpt = max(checkpoint_files, key=os.path.getctime)
-        print(f"Loading checkpoint: {latest_ckpt}")
-        ae_model.load_checkpoint(latest_ckpt)
+    # Load 
+    if args.ckpt_path.endswith(".pt"):
+        print(f"Loading checkpoint: {args.ckpt_path}")
+        # Load the full checkpoint to extract metadata
+        checkpoint = torch.load(args.ckpt_path, map_location=device, weights_only=False)
+        ae_model.load_checkpoint(args.ckpt_path)
+        
+        # Extract global statistics from checkpoint metadata
+        if 'global_mean' in checkpoint and 'global_std' in checkpoint:
+            global_mean = checkpoint['global_mean']
+            global_std = checkpoint['global_std']
+            print(f"Loaded global statistics - Mean: {global_mean}, Std: {global_std}")
+        else:
+            print("Warning: Global statistics not found in checkpoint!")
+            
     else:
-        raise FileNotFoundError(f"No checkpoint files found in {args.ckpt_path}")
+        checkpoint_files = glob.glob(os.path.join(args.ckpt_path, "*.pt"))
+        if checkpoint_files:
+            latest_ckpt = max(checkpoint_files, key=os.path.getctime)
+            print(f"Loading checkpoint: {latest_ckpt}")
+            
+            # Load the full checkpoint to extract metadata
+            checkpoint = torch.load(latest_ckpt, map_location=device, weights_only=False)
+            ae_model.load_checkpoint(latest_ckpt)
+            
+            # Extract global statistics
+            if 'global_mean' in checkpoint and 'global_std' in checkpoint:
+                global_mean = checkpoint['global_mean']
+                global_std = checkpoint['global_std']
+                print(f"Loaded global statistics - Mean: {global_mean}, Std: {global_std}")
+            else:
+                print("Warning: Global statistics not found in checkpoint!")
+        else:
+            raise FileNotFoundError(f"No checkpoint files found in {args.ckpt_path}")
 
     ae_model.to(device)
     ae_model.eval()
@@ -348,16 +395,16 @@ def test(args):
             ll_original = ll.clone()
             
             # Normalize LL the same way as training data (consistent with CustomDataset)
-            ll_mean = ll.mean()
-            ll_std = ll.std() + 1e-8  # Add small epsilon to avoid division by zero
-            ll_normalized = (ll - ll_mean) / ll_std
+            # ll_mean = ll.mean()
+            # ll_std = ll.std() + 1e-8  # Add small epsilon to avoid division by zero
+            ll_normalized = (ll - global_mean) / (global_std + 1e-8)
             
             # Model prediction on normalized LL
             num_dwt_tensor = torch.ones(1, 1, device=device, dtype=torch.float32) * args.num_dwt_levels
             predicted_ll_norm, _ = ae_model(ll_normalized, num_dwt_tensor)
             
             # Denormalize predicted LL back to original DWT coefficient range
-            predicted_ll = predicted_ll_norm * ll_std + ll_mean
+            predicted_ll = predicted_ll_norm * global_std + global_mean
             
             # Calculate LL reconstruction metrics (comparing predicted vs original LL)
             mse_val_ll = F.mse_loss(predicted_ll, ll_original).item()
@@ -456,7 +503,10 @@ def test(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    
+    global_mean, global_std = compute_global_stats(args.train_data_path, split='train', feature_type='image', num_dwt_levels=args.num_dwt_levels)
+    args.global_mean = global_mean
+    args.global_std = global_std
+    print(f"Using global mean: {global_mean}, global std: {global_std}")
     # Determine rank for distributed training
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ['RANK'])
@@ -466,7 +516,7 @@ if __name__ == "__main__":
         is_distributed = False
     
     # Run training
-    train(args)
+    # train(args)
     
     # Wait for all processes to finish training (if distributed)
     if is_distributed:
@@ -475,6 +525,9 @@ if __name__ == "__main__":
             dist.barrier()
     
     # Only run test and cleanup on rank 0
+    # Reset global stats to None to avoid accidental usage in test
+    args.global_mean = None
+    args.global_std = None
     if rank == 0:
         test(args)
         
