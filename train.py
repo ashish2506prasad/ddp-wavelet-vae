@@ -516,7 +516,7 @@ if __name__ == "__main__":
         is_distributed = False
     
     # Run training
-    # train(args)
+    train(args)
     
     # Wait for all processes to finish training (if distributed)
     if is_distributed:
