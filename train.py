@@ -28,13 +28,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 import glob
-from dataset import compute_global_stats
 
 def parse_args():
     """Parse command line arguments"""
     parser = argparse.ArgumentParser(description='Train AutoencoderKL')
     
     # Model architecture arguments
+    parser.add_argument('--image-size', type=int, default=256, choices=[256,512,1024], help='Input image size')
     parser.add_argument('--config-file', type=str, default=None, help='Path to config file (YAML)')
     parser.add_argument('--embed-dim', type=int, default=4, help='Embedding dimension for latent space')
     parser.add_argument('--double-z', type=bool, default=True, help='Use double z channels')
@@ -95,6 +95,8 @@ def parse_args():
     parser.add_argument('--global_mean', type=float, default=None, help='Global mean for LL normalization')
     parser.add_argument('--global_std', type=float, default=None, help='Global std for LL normalization')
 
+    parser.add_argument('--mode', type=str, choices=['debug', 'normal'], default='normal', help='Run mode')
+
     return parser.parse_args()
 
 def create_configs_from_args(args):
@@ -147,9 +149,10 @@ def create_configs_from_args(args):
 
 # Main training function
 def train(args):
-    feature_type = 'image'
     ddconfig, lossconfig = create_configs_from_args(args)
     num_dwt_levels = args.num_dwt_levels
+    args.feature_size = args.resolution
+    assert args.image_size == args.feature_size * (2 ** num_dwt_levels), "Image size must be feature_size * (2 ** num_dwt_levels)"
 
     if args.where == "local":
         # Local single GPU setup
@@ -191,9 +194,9 @@ def train(args):
         model = model.to(device)
         base_model = model
 
-    train_dataset = CustomDataset(args.train_data_path, split='train', feature_type=feature_type, num_dwt_levels=num_dwt_levels, global_mean=args.global_mean, global_std=args.global_std) 
+    train_dataset = CustomDataset(args.train_data_path, split='train', image_size=args.image_size, feature_size=args.feature_size) 
     val_path = args.val_data_path if args.val_data_path else args.train_data_path
-    val_dataset = CustomDataset(val_path, split='val', feature_type=feature_type, num_dwt_levels=num_dwt_levels, global_mean=args.global_mean, global_std=args.global_std)
+    val_dataset = CustomDataset(val_path, split='val', image_size=args.image_size, feature_size=args.feature_size) 
     shuffle = True if args.where == "local" else None
 
     train_sampler = DistributedSampler(train_dataset, num_replicas=world_size, rank=rank) if args.where == "cluster" else None
@@ -225,7 +228,8 @@ def train(args):
         os.makedirs(args.ckpt_path, exist_ok=True)
     if args.where == "cluster":
         dist.barrier()
-    
+    ae_loss_lost = []
+    disc_loss_list = []
     for epoch in range(args.num_epochs):
         if args.where == "cluster":
             train_sampler.set_epoch(epoch)
@@ -235,6 +239,8 @@ def train(args):
         # Training
         avg_ae_loss, avg_disc_loss = base_model.train_epoch(train_dataloader, epoch)
         if rank == 0:
+            ae_loss_lost.append(avg_ae_loss)
+            disc_loss_list.append(avg_disc_loss)
             print(f"Average Training - AE Loss: {avg_ae_loss:.4f}, Disc Loss: {avg_disc_loss:.4f}")
         
         # Validation
@@ -257,8 +263,6 @@ def train(args):
                 # Add global statistics to checkpoint metadata
                 checkpoint_metadata = {
                     "val_losses": val_losses,
-                    "global_mean": args.global_mean,
-                    "global_std": args.global_std,
                     "num_dwt_levels": args.num_dwt_levels
                 }
                 base_model.save_checkpoint(checkpoint_path, epoch+1, checkpoint_metadata)
@@ -269,8 +273,6 @@ def train(args):
         final_ckpt_path = os.path.join(args.ckpt_path, f"final_checkpoint_epoch_{args.num_epochs}.pt")
         final_metadata = {
             "val_losses": val_losses if 'val_losses' in locals() else {},
-            "global_mean": args.global_mean,
-            "global_std": args.global_std,
             "num_dwt_levels": args.num_dwt_levels
         }
         base_model.save_checkpoint(final_ckpt_path, args.num_epochs, final_metadata)
@@ -319,8 +321,7 @@ def test(args):
     
     # Setup dataset and model
     test_dataset = CustomDataset(parent_dir=args.test_data_path, split='test', 
-                                test_data=args.test_data_path, feature_type='image', 
-                                num_dwt_levels=num_dwt_levels)
+                                test_data=args.test_data_path, image_size=args.image_size, feature_size=args.image_size // (2 ** num_dwt_levels))
     loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
 
     ddconfig, lossconfig = create_configs_from_args(args)
@@ -336,14 +337,6 @@ def test(args):
         # Load the full checkpoint to extract metadata
         checkpoint = torch.load(args.ckpt_path, map_location=device, weights_only=False)
         ae_model.load_checkpoint(args.ckpt_path)
-        
-        # Extract global statistics from checkpoint metadata
-        if 'global_mean' in checkpoint and 'global_std' in checkpoint:
-            global_mean = checkpoint['global_mean']
-            global_std = checkpoint['global_std']
-            print(f"Loaded global statistics - Mean: {global_mean}, Std: {global_std}")
-        else:
-            print("Warning: Global statistics not found in checkpoint!")
             
     else:
         checkpoint_files = glob.glob(os.path.join(args.ckpt_path, "*.pt"))
@@ -354,14 +347,6 @@ def test(args):
             # Load the full checkpoint to extract metadata
             checkpoint = torch.load(latest_ckpt, map_location=device, weights_only=False)
             ae_model.load_checkpoint(latest_ckpt)
-            
-            # Extract global statistics
-            if 'global_mean' in checkpoint and 'global_std' in checkpoint:
-                global_mean = checkpoint['global_mean']
-                global_std = checkpoint['global_std']
-                print(f"Loaded global statistics - Mean: {global_mean}, Std: {global_std}")
-            else:
-                print("Warning: Global statistics not found in checkpoint!")
         else:
             raise FileNotFoundError(f"No checkpoint files found in {args.ckpt_path}")
 
@@ -385,6 +370,7 @@ def test(args):
     with torch.no_grad():
         for idx, (image, _) in enumerate(loader):
             original = image.to(device)
+            print(original.shape)
             
             # Extract DWT features
             ll, high_freq_features = extract_dwt_features(original, 
@@ -392,19 +378,16 @@ def test(args):
                                                          device=device)
             
             # Store original LL for comparison
-            ll_original = ll.clone()
-            
-            # Normalize LL the same way as training data (consistent with CustomDataset)
-            # ll_mean = ll.mean()
-            # ll_std = ll.std() + 1e-8  # Add small epsilon to avoid division by zero
-            ll_normalized = (ll - global_mean) / (global_std + 1e-8)
-            
+            ll_original = ll.clone()   # in the range of [-4, 4] 
+            ll_normalized = ll_original/4  # Scale from [-4, 4] to [-1, 1]
+                        
             # Model prediction on normalized LL
             num_dwt_tensor = torch.ones(1, 1, device=device, dtype=torch.float32) * args.num_dwt_levels
             predicted_ll_norm, _ = ae_model(ll_normalized, num_dwt_tensor)
             
-            # Denormalize predicted LL back to original DWT coefficient range
-            predicted_ll = predicted_ll_norm * global_std + global_mean
+            # denormalize predicted LL
+            predicted_ll_denormazed = predicted_ll_norm*4  # Scale back to [-4, 4] 
+            predicted_ll = predicted_ll_denormazed  # for the sake of simplicity, we will keep it as is
             
             # Calculate LL reconstruction metrics (comparing predicted vs original LL)
             mse_val_ll = F.mse_loss(predicted_ll, ll_original).item()
@@ -418,6 +401,11 @@ def test(args):
             hf_components = list(reversed(high_freq_features))  # Reverse for proper order
             for i in range(args.num_dwt_levels):
                 reconstructed = dwt_inverse((reconstructed, [hf_components[i]]))
+
+            reconstructed_clamp = torch.clamp(reconstructed, -1, 1)  # Clamp to expected range [-1, 1]
+            # reconstructed_clamp = reconstructed
+            reconstructed_denorm = (reconstructed_clamp + 1) / 2    # Convert [-1,1] to [0,1]
+            original_denorm = (original + 1) / 2   
             
             # Store reconstruction range for debugging
             recon_min, recon_max = reconstructed.min().item(), reconstructed.max().item()
@@ -433,21 +421,9 @@ def test(args):
                 print(f"  Predicted LL (denorm) range: [{predicted_ll.min():.3f}, {predicted_ll.max():.3f}]")
                 print(f"  Reconstructed range: [{recon_min:.3f}, {recon_max:.3f}]")
             
-            # Denormalize reconstructed image for metrics and saving
-            # Since original images were normalized with mean=0.5, std=0.5 (range [-1,1] -> [0,1])
-            # The reconstruction should be in [-1,1] range, so we convert back to [0,1]
-            if recon_min >= -1.1 and recon_max <= 1.1:  # Reconstructed is likely in [-1,1] range
-                reconstructed_denorm = (reconstructed + 1) / 2  # Convert [-1,1] to [0,1]
-                original_denorm = (original + 1) / 2  # Convert original to [0,1] for fair comparison
-            else:
-                # If reconstruction is not in expected range, clamp to [0,1]
-                reconstructed_denorm = reconstructed.clamp(0, 1)
-                original_denorm = (original + 1) / 2
-            
-            # Calculate full reconstruction metrics
-            mse_val = F.mse_loss(reconstructed_denorm, original_denorm).item()
-            psnr_val = calculate_psnr(reconstructed_denorm, original_denorm).item()
-            ssim_val = calculate_ssim(reconstructed_denorm, original_denorm).item()
+            mse_val = F.mse_loss(reconstructed_denorm, original_denorm).item()  # in the range of [0,1]
+            psnr_val = calculate_psnr(reconstructed_denorm, original_denorm).item()  # in the range of [0,1]
+            ssim_val = calculate_ssim(reconstructed_denorm, original_denorm).item()  # in the range of [0,1]
             
             # Store metrics
             mse_list.append(mse_val)
@@ -500,13 +476,8 @@ def test(args):
     print(f"\nMetrics saved to: {os.path.join(output_dir, 'metrics.csv')}")
     print(f"Images saved to: {output_dir}")
 
-
 if __name__ == "__main__":
     args = parse_args()
-    global_mean, global_std = compute_global_stats(args.train_data_path, split='train', feature_type='image', num_dwt_levels=args.num_dwt_levels)
-    args.global_mean = global_mean
-    args.global_std = global_std
-    print(f"Using global mean: {global_mean}, global std: {global_std}")
     # Determine rank for distributed training
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         rank = int(os.environ['RANK'])
@@ -524,10 +495,6 @@ if __name__ == "__main__":
         if dist.is_initialized():
             dist.barrier()
     
-    # Only run test and cleanup on rank 0
-    # Reset global stats to None to avoid accidental usage in test
-    args.global_mean = None
-    args.global_std = None
     if rank == 0:
         test(args)
         
